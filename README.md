@@ -311,9 +311,3 @@ streamlit run app.py
 | **Language** | Python 3.10+ |
 
 ---
-
-## Team
-
-Venkatesh Akula (220109), Venkata Sritan (220280), Sai Nikhil (221095), Tejasri Saladi (220941), Nayan Verma (220703)
-
-**Indian Institute of Technology Kanpur** — DES646: AI in Design, 2024–25
