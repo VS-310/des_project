@@ -1,0 +1,549 @@
+"""High-level orchestration logic for the design fairness assistant."""
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .audits.accessibility import AccessibilityAuditor, AccessibilityReport
+from .audits.contrast import ContrastAuditor, ContrastReport, ContrastViolation
+from .audits.dark_patterns import DarkPatternAuditor, DarkPatternReport, DarkPatternFlag
+from .collectors.selenium_collector import SeleniumCollector, SeleniumArtifacts
+from .collectors.screenshot_loader import ScreenshotLoader
+from .fusion import DesignFairnessScore
+from .reporting import PDFReportWriter, JSONReportWriter, MarkdownReportWriter
+
+try:
+    from .audits.agentic import AgenticAuditor, AgenticReport
+except ImportError:  # pragma: no cover
+    AgenticAuditor = None
+    AgenticReport = None
+
+try:
+    from .remediation import RemediationEngine, RemediationReport
+except ImportError:  # pragma: no cover
+    RemediationEngine = None
+    RemediationReport = None
+
+try:
+    from .llm_integration import LLMAnalyzer
+except ImportError:  # pragma: no cover - optional dependency
+    LLMAnalyzer = None
+
+if TYPE_CHECKING:
+    try:
+        from .llm_integration import LLMConfig
+    except ImportError:
+        LLMConfig = None
+
+
+class InputMode(str, Enum):
+    """Enumerates supported input modalities."""
+
+    URL = "url"
+    SCREENSHOT = "screenshot"
+
+
+@dataclass
+class PipelineResult:
+    """Aggregated audit outputs and scoring metadata."""
+
+    accessibility: Optional[AccessibilityReport]
+    contrast: ContrastReport
+    dark_patterns: DarkPatternReport
+    fairness: DesignFairnessScore
+    artifacts: Dict[str, Any]
+    agentic: Optional[Any] = None       # AgenticReport when available
+    remediation: Optional[Any] = None   # RemediationReport when available
+
+    def to_json_dict(self) -> Dict[str, Any]:
+        result = {
+            "fairness": self.fairness.to_dict(),
+            "accessibility": self.accessibility.to_dict() if self.accessibility else None,
+            "contrast": self.contrast.to_dict(),
+            "dark_patterns": self.dark_patterns.to_dict(),
+            "artifacts": {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in self.artifacts.items()
+                if key != "llm_analysis"  # keep JSON serializable
+            },
+        }
+        if self.agentic is not None:
+            result["agentic"] = self.agentic.to_dict()
+        if self.remediation is not None:
+            result["remediation"] = self.remediation.to_dict()
+        if "llm_analysis" in self.artifacts:
+            result["llm_analysis"] = self.artifacts["llm_analysis"]
+        return result
+
+
+class DesignAssistant:
+    """Coordinates collectors, audits, and report generation."""
+
+    def __init__(
+        self,
+        selenium_collector: Optional[SeleniumCollector] = None,
+        accessibility_auditor: Optional[AccessibilityAuditor] = None,
+        contrast_auditor: Optional[ContrastAuditor] = None,
+        dark_pattern_auditor: Optional[DarkPatternAuditor] = None,
+        pdf_writer: Optional[PDFReportWriter] = None,
+        json_writer: Optional[JSONReportWriter] = None,
+        markdown_writer: Optional[MarkdownReportWriter] = None,
+        llm_config: Optional[Any] = None,
+        alpha: float = 0.4,
+        beta: float = 0.3,
+        enable_agentic: bool = True,
+        enable_remediation: bool = True,
+        contrast_method: str = "kmeans_cielab",
+    ) -> None:
+        self.selenium_collector = selenium_collector or SeleniumCollector()
+        self.accessibility_auditor = accessibility_auditor or AccessibilityAuditor()
+        self.contrast_auditor = contrast_auditor or ContrastAuditor(method=contrast_method)
+        self.dark_pattern_auditor = dark_pattern_auditor or DarkPatternAuditor()
+        self.llm_config = llm_config
+        self.llm_analyzer: Optional[Any] = None
+        self.alpha = alpha
+        self.beta = beta
+        self.enable_agentic = enable_agentic and AgenticAuditor is not None
+        self.enable_remediation = enable_remediation and RemediationEngine is not None
+
+        if llm_config and LLMAnalyzer is not None:
+            try:
+                self.llm_analyzer = LLMAnalyzer(llm_config)
+            except Exception as exc:  # pragma: no cover
+                print(f"DEBUG: Failed to initialize LLMAnalyzer: {exc}")
+                self.llm_analyzer = None
+
+        # Agentic auditor
+        self.agentic_auditor = None
+        if self.enable_agentic:
+            self.agentic_auditor = AgenticAuditor()
+
+        # Remediation engine
+        self.remediation_engine = None
+        if self.enable_remediation:
+            self.remediation_engine = RemediationEngine(llm_config=llm_config)
+
+        # Report writers
+        if pdf_writer is None:
+            self.pdf_writer = PDFReportWriter(llm_config=llm_config)
+        else:
+            self.pdf_writer = pdf_writer
+
+        self.json_writer = json_writer or JSONReportWriter()
+
+        if markdown_writer is None:
+            self.markdown_writer = MarkdownReportWriter(llm_config=llm_config)
+        else:
+            self.markdown_writer = markdown_writer
+
+    def _save_analysis_images(self, screenshot, contrast_report, output_dir: Path) -> List[str]:
+        """Save analysis images for PDF reports."""
+        analysis_images = []
+
+        try:
+            original_screenshot_path = output_dir / "original_screenshot.png"
+            if hasattr(screenshot, 'image') and screenshot.image is not None:
+                from PIL import Image
+                if hasattr(screenshot.image, 'save'):
+                    screenshot.image.save(original_screenshot_path)
+                else:
+                    import cv2
+                    cv2.imwrite(str(original_screenshot_path), screenshot.image)
+                analysis_images.append(str(original_screenshot_path))
+
+            if hasattr(contrast_report, 'violations') and contrast_report.violations:
+                contrast_img_path = output_dir / "contrast_analysis.png"
+                self._create_contrast_visualization(contrast_report, screenshot, str(contrast_img_path))
+                analysis_images.append(str(contrast_img_path))
+
+        except Exception as e:
+            print(f"Warning: Could not save analysis images: {e}")
+
+        return analysis_images
+
+    def _create_contrast_visualization(self, contrast_report, screenshot, output_path: str):
+        """Create a visualization showing contrast violations."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            if hasattr(contrast_report, 'violations') and contrast_report.violations:
+                violation_ratios = [v.contrast_ratio for v in contrast_report.violations if v.contrast_ratio]
+                if violation_ratios:
+                    ax.bar(range(len(violation_ratios)), violation_ratios, color='red', alpha=0.7)
+                    ax.axhline(y=4.5, color='green', linestyle='--', label='WCAG AA (4.5:1)')
+                    ax.axhline(y=3.0, color='orange', linestyle='--', label='WCAG AA Large (3:1)')
+                    ax.set_title(f'Contrast Violations ({len(violation_ratios)} regions)')
+                    ax.set_ylabel('Contrast Ratio')
+                    ax.set_xlabel('Region')
+                    ax.legend()
+                    plt.tight_layout()
+
+                plt.savefig(output_path, dpi=150, bbox_inches='tight')
+                plt.close()
+            else:
+                fig, ax = plt.subplots(figsize=(8, 2))
+                ax.text(0.5, 0.5, '✅ No Contrast Violations Found',
+                    ha='center', va='center', fontsize=16, color='green')
+                ax.axis('off')
+                plt.savefig(output_path, dpi=150, bbox_inches='tight')
+                plt.close()
+
+        except Exception as e:
+            print(f"Could not create contrast visualization: {e}")
+
+    def run(self, mode: InputMode, value: str, *, output_dir: Optional[Path] = None) -> PipelineResult:
+        """Execute the design assistant pipeline for the provided input."""
+
+        output_dir = output_dir or Path("outputs")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Selenium driver reference for agentic auditing
+        driver_for_agentic = None
+
+        if mode is InputMode.URL:
+            selenium_artifacts = self._collect_from_url(value, output_dir)
+            screenshot = selenium_artifacts.screenshot
+            dom_text = selenium_artifacts.visible_text
+            accessibility_report = selenium_artifacts.accessibility
+        elif mode is InputMode.SCREENSHOT:
+            selenium_artifacts = None
+            screenshot_loader = ScreenshotLoader()
+            screenshot = screenshot_loader.load_from_path(value)
+            dom_text = ""
+            accessibility_report = None
+        else:
+            raise ValueError(f"Unsupported input mode: {mode}")
+
+        # --- Static audits ---
+        contrast_report = self.contrast_auditor.audit(screenshot.image)
+        dark_pattern_report = self.dark_pattern_auditor.audit(dom_text)
+
+        # --- Agentic audit (URL mode only) ---
+        agentic_report = None
+        if self.agentic_auditor and mode is InputMode.URL:
+            try:
+                agentic_report = self._run_agentic_audit(value)
+            except Exception as exc:
+                print(f"DEBUG: Agentic audit failed: {exc}")
+
+        # --- LLM validation ---
+        llm_analysis: Optional[dict] = None
+        if self.llm_analyzer and self.llm_analyzer.is_available():
+            llm_analysis = self._refine_with_llm(
+                screenshot_path=str(getattr(screenshot, "path", "")) if screenshot else None,
+                url=selenium_artifacts.url if selenium_artifacts else None,
+                dom_excerpt=dom_text,
+                accessibility_report=accessibility_report,
+                contrast_report=contrast_report,
+                dark_pattern_report=dark_pattern_report,
+            )
+
+            if llm_analysis:
+                if "dark_patterns" in llm_analysis:
+                    dark_pattern_report = self._llm_to_dark_pattern_report(
+                        llm_analysis["dark_patterns"],
+                        fallback=dark_pattern_report,
+                    )
+                if "contrast" in llm_analysis:
+                    contrast_report = self._llm_to_contrast_report(
+                        llm_analysis["contrast"],
+                        fallback=contrast_report,
+                    )
+
+        # --- Hierarchical DFS computation ---
+        fairness_score = DesignFairnessScore.from_components(
+            accessibility_score=accessibility_report.score if accessibility_report else None,
+            ethical_score=dark_pattern_report.score,
+            contrast_score=getattr(contrast_report, 'contrast_score', None),
+            keyboard_score=agentic_report.keyboard_score if agentic_report else None,
+            screen_reader_score=agentic_report.screen_reader_score if agentic_report else None,
+            alpha=self.alpha,
+            beta=self.beta,
+        )
+
+        # --- Predictive remediation ---
+        remediation_report = None
+        if self.remediation_engine:
+            try:
+                all_issues = self._collect_all_issues(
+                    accessibility_report, contrast_report, dark_pattern_report, agentic_report
+                )
+                if all_issues:
+                    remediation_report = self.remediation_engine.generate(
+                        issues=all_issues,
+                        html_snippet=dom_text[:3000] if dom_text else "",
+                        url=selenium_artifacts.url if selenium_artifacts else None,
+                        current_scores={
+                            "technical": fairness_score.technical.value,
+                            "perceptual": fairness_score.perceptual.value,
+                            "ethical": fairness_score.ethical.value,
+                        },
+                    )
+            except Exception as exc:
+                print(f"DEBUG: Remediation generation failed: {exc}")
+
+        # --- Build artifacts ---
+        analysis_images = self._save_analysis_images(
+            screenshot=screenshot,
+            contrast_report=contrast_report,
+            output_dir=output_dir
+        )
+
+        artifacts: Dict[str, Any] = {
+            "screenshot_path": screenshot.path,
+            "dom_text": dom_text[:1000],
+            "analysis_images": analysis_images,
+        }
+        if selenium_artifacts:
+            artifacts.update({
+                "url": selenium_artifacts.url,
+                "dom_path": selenium_artifacts.dom_path,
+                "axe_json_path": selenium_artifacts.axe_json_path,
+            })
+        if llm_analysis:
+            artifacts["llm_analysis"] = llm_analysis
+
+        result = PipelineResult(
+            accessibility=accessibility_report,
+            contrast=contrast_report,
+            dark_patterns=dark_pattern_report,
+            fairness=fairness_score,
+            artifacts=artifacts,
+            agentic=agentic_report,
+            remediation=remediation_report,
+        )
+
+        # --- Write reports ---
+        self.json_writer.write(result, output_dir / "audit.json")
+        self.pdf_writer.write(result, output_dir / "audit.pdf")
+        self.markdown_writer.write(result, output_dir / "audit_report.md")
+
+        return result
+
+    def _run_agentic_audit(self, url: str) -> Any:
+        """Spin up a short-lived Selenium session for agentic interaction."""
+        from .collectors.selenium_collector import SeleniumCollector
+
+        collector = SeleniumCollector()
+        driver = collector.driver_factory()
+        try:
+            driver.set_page_load_timeout(30)
+            driver.get(url)
+            import time
+            time.sleep(2)
+            return self.agentic_auditor.audit(driver)
+        finally:
+            driver.quit()
+
+    def _collect_from_url(self, url: str, output_dir: Path) -> SeleniumArtifacts:
+        collector_result = self.selenium_collector.collect(url, output_dir=output_dir)
+        if collector_result.accessibility is None and collector_result.axe_results is not None:
+            collector_result = replace(
+                collector_result,
+                accessibility=self.accessibility_auditor.audit_from_raw(
+                    collector_result.axe_results
+                ),
+            )
+        return collector_result
+
+    def _collect_all_issues(
+        self,
+        accessibility_report,
+        contrast_report,
+        dark_pattern_report,
+        agentic_report,
+    ) -> List[Dict[str, Any]]:
+        """Flatten all issues into a list of dicts for remediation."""
+        issues = []
+
+        # Accessibility
+        if accessibility_report:
+            for v in accessibility_report.violations[:5]:
+                issues.append({
+                    "category": "accessibility",
+                    "severity": v.impact or "moderate",
+                    "description": v.description,
+                    "element_info": ", ".join(v.nodes[:2]) if v.nodes else None,
+                    "wcag_criterion": v.violation_id,
+                    "recommendation": f"See: {v.help_url}" if v.help_url else None,
+                })
+
+        # Contrast
+        for v in contrast_report.violations[:3]:
+            issues.append({
+                "category": "contrast",
+                "severity": "moderate" if v.contrast_ratio and v.contrast_ratio > 3.0 else "serious",
+                "description": v.description or f"Low contrast region: {v.contrast_ratio:.2f}:1" if v.contrast_ratio else "Low contrast",
+                "element_info": str(v.bbox) if v.bbox else None,
+            })
+
+        # Dark patterns
+        for f in dark_pattern_report.flags[:3]:
+            issues.append({
+                "category": "dark_pattern",
+                "severity": "serious" if f.score > 0.7 else "moderate",
+                "description": f"Dark pattern ({f.label}): {f.text[:100]}",
+                "element_info": f.label,
+            })
+
+        # Agentic
+        if agentic_report:
+            all_agentic = (
+                list(agentic_report.keyboard_issues) +
+                list(agentic_report.screen_reader_issues) +
+                list(agentic_report.functional_issues)
+            )
+            for issue in all_agentic[:5]:
+                issues.append({
+                    "category": issue.category,
+                    "severity": issue.severity,
+                    "description": issue.description,
+                    "element_info": issue.element_info,
+                    "wcag_criterion": issue.wcag_criterion,
+                    "recommendation": issue.recommendation,
+                })
+
+        return issues
+
+    def _refine_with_llm(
+        self,
+        *,
+        screenshot_path: Optional[str],
+        url: Optional[str],
+        dom_excerpt: Optional[str],
+        accessibility_report: Optional[AccessibilityReport],
+        contrast_report: ContrastReport,
+        dark_pattern_report: DarkPatternReport,
+    ) -> Optional[dict]:
+        if not self.llm_analyzer:
+            return None
+
+        accessibility_summary = None
+        if accessibility_report is not None:
+            accessibility_summary = {
+                "score": getattr(accessibility_report, "score", None),
+                "violation_count": len(getattr(accessibility_report, "violations", []) or []),
+            }
+
+        contrast_summary = {
+            "heuristic_average_contrast": contrast_report.average_contrast,
+            "heuristic_violation_count": len(contrast_report.violations or []),
+        }
+
+        dark_pattern_summary = {
+            "heuristic_score": dark_pattern_report.score,
+            "heuristic_flag_count": len(dark_pattern_report.flags or []),
+            "heuristic_examples": [flag.to_dict() for flag in dark_pattern_report.flags][:5],
+        }
+
+        return self.llm_analyzer.assess_design_multimodal(
+            screenshot_path=screenshot_path,
+            url=url,
+            dom_excerpt=dom_excerpt,
+            accessibility_summary=accessibility_summary,
+            contrast_summary=contrast_summary,
+            dark_pattern_summary=dark_pattern_summary,
+        )
+
+    def _llm_to_dark_pattern_report(
+        self,
+        payload: dict,
+        *,
+        fallback: DarkPatternReport,
+    ) -> DarkPatternReport:
+        severity_weights = {
+            "none": 0.0,
+            "low": 0.25,
+            "medium": 0.5,
+            "high": 0.9,
+        }
+
+        flags = []
+        weighted_sum = 0.0
+        count = 0
+
+        for item in payload.get("patterns", []):
+            label = (item.get("label") or "Dark Pattern").strip()
+            severity = (item.get("severity") or "none").lower()
+            confidence = float(item.get("confidence", 0.0))
+            explanation = (item.get("explanation") or "").strip()
+            recommendation = (item.get("recommendation") or "").strip()
+
+            details = []
+            if explanation:
+                details.append(explanation)
+            if recommendation:
+                details.append(f"Recommendation: {recommendation}")
+            details.append(f"Severity: {severity.title()} | Confidence: {confidence:.2f}")
+
+            flags.append(
+                DarkPatternFlag(
+                    label=label,
+                    score=confidence,
+                    text=" \n".join(details),
+                )
+            )
+
+            weighted_sum += severity_weights.get(severity, 0.0) * confidence
+            count += 1
+
+        if payload.get("overall_score") is not None:
+            score = float(payload["overall_score"])
+        elif count:
+            score = max(0.0, 1.0 - (weighted_sum / count))
+        else:
+            score = fallback.score
+
+        score = max(0.0, min(1.0, score))
+
+        raw_outputs = {"llm": payload}
+        if fallback.raw_outputs:
+            raw_outputs["heuristic"] = fallback.raw_outputs
+
+        return DarkPatternReport(score=score, flags=flags, raw_outputs=raw_outputs)
+
+    def _llm_to_contrast_report(
+        self,
+        payload: dict,
+        *,
+        fallback: ContrastReport,
+    ) -> ContrastReport:
+        issues = []
+        for item in payload.get("issues", []):
+            area = (item.get("area") or "Contrast Issue").strip()
+            severity = (item.get("severity") or "unknown").strip()
+            explanation = (item.get("explanation") or "").strip()
+            recommendation = (item.get("recommendation") or "").strip()
+
+            description_parts = [area]
+            if explanation:
+                description_parts.append(explanation)
+            if recommendation:
+                description_parts.append(f"Recommendation: {recommendation}")
+            description_parts.append(f"Severity: {severity.title()}")
+
+            issues.append(
+                ContrastViolation(
+                    bbox=None,
+                    contrast_ratio=item.get("contrast_ratio_estimate"),
+                    description=" | ".join(description_parts),
+                )
+            )
+
+        if payload.get("overall_score") is not None:
+            avg_contrast = float(payload["overall_score"])
+        else:
+            avg_contrast = fallback.average_contrast
+
+        avg_contrast = max(0.0, min(1.0, avg_contrast))
+
+        if not issues and fallback.violations:
+            return fallback
+
+        return ContrastReport(average_contrast=avg_contrast, violations=issues)

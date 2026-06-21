@@ -1,0 +1,25 @@
+# Core dependencies
+streamlit>=1.30.0
+pandas>=2.0.0
+plotly>=5.18.0
+Pillow>=10.0.0
+
+# Auditing
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+axe-selenium-python>=2.1.6
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+
+# NLP / Dark patterns
+transformers>=4.30.0
+
+# AI integration 
+google-generativeai>=0.3.0
+
+# Reporting
+reportlab>=4.0.0
+matplotlib>=3.7.0
+
+# Testing
+pytest>=7.4.0
